@@ -43,6 +43,14 @@ jobs:
       - name: Run tests
         run: swift test --parallel
 
+      # Prints per-frame decode timings so changes to the screen pipeline can be
+      # compared between runs. Informational only; it never fails the build.
+      - name: Screen pipeline benchmark
+        continue-on-error: true
+        env:
+          MACVIEWER_PIXEL_BENCHMARK: "1"
+        run: swift test -c release --filter "rendererFrameReleaseBenchmark|rendererPixelPipelineReleaseBenchmark"
+
       - name: Package app
         env:
           MACVIEWER_SIGNING_IDENTITY: "-"
