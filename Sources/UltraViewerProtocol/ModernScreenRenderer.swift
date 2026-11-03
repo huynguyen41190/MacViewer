@@ -150,51 +150,22 @@ public final class ModernScreenRenderer {
             throw ModernScreenMessageError.sequenceMismatch(expected: expectedSequence, received: message.frameNumber)
         }
         let rawPixels = try decodeMainPixels(message)
-        var next = state
 
-        // 0x06000c65 IL_01c9..032c: capture main→converter, then converter→main.
-        if let scroll = message.scroll {
-            try copyMainToTemporary(&next, source: scroll.capture,
-                                    destinationX: scroll.capture.x,
-                                    destinationY: scroll.capture.y - scroll.verticalDelta)
-            for region in scroll.copyBack {
-                copyTemporaryToMain(&next, sourceX: region.x, sourceY: region.y, destination: region)
-            }
+        // Every check that can reject the mission runs before any pixel is
+        // written, so failures still leave bitmap, converter, cache and
+        // sequence untouched. Drawing then happens in place: copying the whole
+        // state per frame (≈50 MB on a 4K desktop) used to dominate decoding
+        // time, and the peer only sends the next frame after we acknowledge.
+        for reference in message.cacheReferences where state.cache[reference.hash] == nil {
+            throw ModernScreenMessageError.cacheMiss(reference.hash)
         }
-
-        // IL_032c..0443: cache references write the converter, not the main DIB.
-        for reference in message.cacheReferences {
-            guard let item = next.cache[reference.hash] else {
-                throw ModernScreenMessageError.cacheMiss(reference.hash)
-            }
-            try next.temporary.copyRectangle(item.pixels, width: item.width, height: item.height,
-                                             atX: reference.x, atY: reference.y)
-            next.cacheOrder.removeAll { $0 == reference.hash }
-            next.cacheOrder.append(reference.hash)
-        }
-
-        // IL_0443..0512: expose selected converter rectangles to the main DIB.
-        for region in message.copyFromTemporary {
-            copyTemporaryToMain(&next, sourceX: region.x, sourceY: region.y, destination: region)
-        }
-
-        // IL_0512..0886: JPEG atlas tiles write full color directly to main.
+        var auxiliary: (atlas: AuxiliaryAtlas, placements: [AtlasPlacement])?
         if !message.auxiliaryRectangles.isEmpty {
             let atlas = try decodeAuxiliaryJPEG(message.auxiliaryJPEG)
-            try applyAuxiliary(atlas, rectangles: message.auxiliaryRectangles, to: &next)
+            auxiliary = (atlas, try auxiliaryPlacements(atlas, rectangles: message.auxiliaryRectangles))
         }
-
-        // IL_0995..0d8a: each packed raw rectangle stages at converter (0,0).
-        var offset = 0
-        for rectangle in message.mainRectangles {
-            let count = try Self.product(try Self.product(rectangle.width, rectangle.height), 2)
-            let bytes = rawPixels[(rawPixels.startIndex + offset)..<(rawPixels.startIndex + offset + count)]
-            try next.temporary.copyRectangle(bytes, width: rectangle.width, height: rectangle.height, atX: 0, atY: 0)
-            copyTemporaryToMain(&next, sourceX: 0, sourceY: 0, destination: rectangle)
-            offset += count
-        }
-
-        // IL_0d8a..0f3d: cache captures occur after every drawing operation.
+        var newCacheHashes = Set<Int32>()
+        var newCacheBytes = 0
         for addition in message.cacheAdditions {
             let region = addition.region
             // Ordinal 15's out-of-bounds extraction is not established. Do not
@@ -202,24 +173,72 @@ public final class ModernScreenRenderer {
             guard isInside(region, width: width, height: height) else {
                 throw ModernScreenMessageError.invalidGeometry
             }
-            try copyMainToTemporary(&next, source: region, destinationX: region.x, destinationY: region.y)
-            let captured = try extractTemporary(next.temporary, region: region)
-            if next.cache[addition.hash] == nil {
-                guard captured.count <= limits.maximumCacheBytes - next.cacheBytes else {
-                    throw ModernScreenMessageError.cacheBudgetExceeded
-                }
-                next.cache[addition.hash] = CachedRectangle(width: region.width, height: region.height, pixels: captured)
-                next.cacheOrder.append(addition.hash)
-                next.cacheBytes += captured.count
+            guard state.cache[addition.hash] == nil, newCacheHashes.insert(addition.hash).inserted else { continue }
+            let count = try Self.product(try Self.product(region.width, region.height), 2)
+            guard count <= limits.maximumCacheBytes - state.cacheBytes - newCacheBytes else {
+                throw ModernScreenMessageError.cacheBudgetExceeded
+            }
+            newCacheBytes += count
+        }
+
+        // From here on nothing can fail: geometry, sizes and cache hits are
+        // validated, copies are clipped, and the arithmetic was checked above.
+        // 0x06000c65 IL_01c9..032c: capture main→converter, then converter→main.
+        if let scroll = message.scroll {
+            try copyMainToTemporary(&state, source: scroll.capture,
+                                    destinationX: scroll.capture.x,
+                                    destinationY: scroll.capture.y - scroll.verticalDelta)
+            for region in scroll.copyBack {
+                copyTemporaryToMain(&state, sourceX: region.x, sourceY: region.y, destination: region)
+            }
+        }
+
+        // IL_032c..0443: cache references write the converter, not the main DIB.
+        for reference in message.cacheReferences {
+            guard let item = state.cache[reference.hash] else { continue } // validated above
+            try state.temporary.copyRectangle(item.pixels, width: item.width, height: item.height,
+                                              atX: reference.x, atY: reference.y)
+            state.cacheOrder.removeAll { $0 == reference.hash }
+            state.cacheOrder.append(reference.hash)
+        }
+
+        // IL_0443..0512: expose selected converter rectangles to the main DIB.
+        for region in message.copyFromTemporary {
+            copyTemporaryToMain(&state, sourceX: region.x, sourceY: region.y, destination: region)
+        }
+
+        // IL_0512..0886: JPEG atlas tiles write full color directly to main.
+        if let auxiliary {
+            blitAuxiliary(auxiliary.atlas, placements: auxiliary.placements, to: &state)
+        }
+
+        // IL_0995..0d8a: each packed raw rectangle stages at converter (0,0).
+        var offset = 0
+        for rectangle in message.mainRectangles {
+            let count = try Self.product(try Self.product(rectangle.width, rectangle.height), 2)
+            let bytes = rawPixels[(rawPixels.startIndex + offset)..<(rawPixels.startIndex + offset + count)]
+            try state.temporary.copyRectangle(bytes, width: rectangle.width, height: rectangle.height, atX: 0, atY: 0)
+            copyTemporaryToMain(&state, sourceX: 0, sourceY: 0, destination: rectangle)
+            offset += count
+        }
+
+        // IL_0d8a..0f3d: cache captures occur after every drawing operation.
+        for addition in message.cacheAdditions {
+            let region = addition.region
+            try copyMainToTemporary(&state, source: region, destinationX: region.x, destinationY: region.y)
+            let captured = try extractTemporary(state.temporary, region: region)
+            if state.cache[addition.hash] == nil {
+                state.cache[addition.hash] = CachedRectangle(width: region.width, height: region.height, pixels: captured)
+                state.cacheOrder.append(addition.hash)
+                state.cacheBytes += captured.count
             }
         }
         // Preserve native trim timing and insertion/reference order.
-        while next.cacheOrder.count > 1000 {
-            let hash = next.cacheOrder.removeFirst()
-            if let removed = next.cache.removeValue(forKey: hash) { next.cacheBytes -= removed.pixels.count }
+        while state.cacheOrder.count > 1000 {
+            let hash = state.cacheOrder.removeFirst()
+            if let removed = state.cache.removeValue(forKey: hash) { state.cacheBytes -= removed.pixels.count }
         }
 
-        state = next
         lastFrameNumber = message.frameNumber
         return bitmap
     }
@@ -365,10 +384,10 @@ public final class ModernScreenRenderer {
         let sourceX, sourceY, width, height, destinationX, destinationY: Int
     }
 
-    private func applyAuxiliary(_ atlas: AuxiliaryAtlas, rectangles: [ScreenRegion], to state: inout State) throws {
-        let placements: [AtlasPlacement]
+    /// Validates the atlas walk without touching pixels; see `blitAuxiliary`.
+    private func auxiliaryPlacements(_ atlas: AuxiliaryAtlas, rectangles: [ScreenRegion]) throws -> [AtlasPlacement] {
         if let walk = try atlasWalk(atlas, rectangles: rectangles, tileSize: tileSize) {
-            placements = walk.placements
+            return walk.placements
         } else if let (size, walk) = alternateAtlasWalk(atlas, rectangles: rectangles) {
             // The sender changed its tile size without this renderer seeing the
             // command 48 (or initialization) that carried it. Only a size that
@@ -376,12 +395,15 @@ public final class ModernScreenRenderer {
             Logger(subsystem: "dev.macviewer.app", category: "screen").notice(
                 "Atlas tile size \(self.tileSize) did not fit atlas=\(atlas.width)x\(atlas.height); using \(size)")
             tileSize = size
-            placements = walk.placements
+            return walk.placements
         } else {
             Logger(subsystem: "dev.macviewer.app", category: "screen").error(
                 "Atlas bounds: atlas=\(atlas.width)x\(atlas.height) tile=\(self.tileSize) rectangles=\(rectangles.count)")
             throw ModernScreenMessageError.auxiliaryAtlasOutOfBounds
         }
+    }
+
+    private func blitAuxiliary(_ atlas: AuxiliaryAtlas, placements: [AtlasPlacement], to state: inout State) {
         let mainWidth = width
         atlas.pixels.withUnsafeBytes { (source: UnsafeRawBufferPointer) in
             state.mainPixels.withUnsafeMutableBytes { (target: UnsafeMutableRawBufferPointer) in
