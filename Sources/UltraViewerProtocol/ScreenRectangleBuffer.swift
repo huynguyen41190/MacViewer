@@ -57,16 +57,19 @@ public struct ScreenRectangleBuffer: Equatable, Sendable {
         let copyWidth = min(sourceWidth - sourceX, width - destinationX)
         let copyHeight = min(sourceHeight - sourceY, height - destinationY)
         let copyBytes = copyWidth * bytesPerPixel
-
-        for row in 0..<copyHeight {
-            let sourceOffset = (sourceY + row) * sourceStride + sourceX * bytesPerPixel
-            let destinationOffset = (height - 1 - (destinationY + row)) * rowStride + destinationX * bytesPerPixel
-            let sourceStart = source.startIndex + sourceOffset
-            let destinationStart = pixels.startIndex + destinationOffset
-            pixels.replaceSubrange(
-                destinationStart..<(destinationStart + copyBytes),
-                with: source[sourceStart..<(sourceStart + copyBytes)]
-            )
+        // Plain row memcpy into the existing storage. Per-row Data.replaceSubrange
+        // re-checked uniqueness and bounds for every row of every rectangle.
+        let pixelBytes = bytesPerPixel, destinationStride = rowStride, destinationHeight = height
+        source.withUnsafeBytes { (input: UnsafeRawBufferPointer) in
+            pixels.withUnsafeMutableBytes { (output: UnsafeMutableRawBufferPointer) in
+                guard let from = input.baseAddress, let to = output.baseAddress else { return }
+                for row in 0..<copyHeight {
+                    let sourceOffset = (sourceY + row) * sourceStride + sourceX * pixelBytes
+                    let destinationOffset = (destinationHeight - 1 - (destinationY + row)) * destinationStride
+                        + destinationX * pixelBytes
+                    (to + destinationOffset).copyMemory(from: from + sourceOffset, byteCount: copyBytes)
+                }
+            }
         }
     }
 
